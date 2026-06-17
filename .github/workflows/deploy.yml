@@ -1,0 +1,80 @@
+name: Deploy static site
+
+on:
+  push:
+    branches: [main]
+    # Only run when website files or workflow changes
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy.yml"
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+permissions:
+  id-token: write   # Required for OIDC -> AWS role assumption
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    # Add environment protection for production
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-south-1
+          # Add audit logging
+          audience: sts.amazonaws.com
+
+      - name: Sync site to S3
+        run: |
+          echo "📦 Syncing files to S3 bucket: ${{ secrets.S3_BUCKET_NAME }}"
+          aws s3 sync ./site s3://${{ secrets.S3_BUCKET_NAME }} \
+            --delete \
+            --exclude ".git/*" \
+            --exclude "*.md" \
+            --cache-control "public, max-age=3600"
+          
+          # Set specific cache-control for HTML files
+          aws s3 sync ./site s3://${{ secrets.S3_BUCKET_NAME }} \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          echo "🔄 Invalidating CloudFront cache for distribution: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}"
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          
+          echo "✅ Invalidation created: $INVALIDATION_ID"
+          
+          # Wait for invalidation to complete (optional)
+          # aws cloudfront wait invalidation-completed \
+          #   --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+          #   --id $INVALIDATION_ID
+
+      - name: Display deployment URL
+        run: |
+          echo "🌐 Website deployed to:"
+          echo "https://${{ secrets.CLOUDFRONT_DOMAIN_NAME }}"
